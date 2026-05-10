@@ -21,6 +21,7 @@ cleanup:
   - /share/doc
   - /share/gir-1.0
   - /lib/girepository-1.0
+  - /share/icons/hicolor/symbolic/apps/org.deskflow.deskflow-symbolic.svg
 modules:
   - name: python3-Jinja2
     buildsystem: simple
@@ -43,6 +44,7 @@ modules:
   - name: libei
     buildsystem: meson
     config-opts:
+        - --libdir=lib
         - -Ddocumentation=[]
         - -Dtests=disabled
         - -Dliboeffis=disabled
@@ -57,6 +59,7 @@ modules:
   - name: libportal
     buildsystem: meson
     config-opts:
+      - --libdir=lib
       - -Ddocs=false
       - -Dtests=false
       - -Dportal-tests=false
@@ -88,4 +91,3 @@ modules:
     sources:
       - type: dir
         path: ../../../
-

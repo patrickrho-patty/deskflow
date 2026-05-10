@@ -14,13 +14,17 @@
 
 #include <Carbon/Carbon.h>
 #include <IOKit/IOMessage.h>
+#include <IOKit/hid/IOHIDValue.h>
 #include <mach/mach_init.h>
 #include <mach/mach_interface.h>
 #include <mach/mach_port.h>
 
+#include <array>
+#include <atomic>
 #include <bitset>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -117,9 +121,16 @@ private:
   // event, false if it is a mouseup event.  macButton is the index
   // of the button pressed using the mac button mapping.
   bool onMouseButton(bool pressed, uint16_t macButton);
+  void sendMouseButtonEvent(bool pressed, ButtonID button, KeyModifierMask mask) const;
+  void postLocalNavigationShortcut(ButtonID button) const;
+  bool onAuxMouseButtons(CGEventRef event);
+  void onHIDInputValue(IOHIDValueRef value);
+  bool shouldIgnoreQuartzMouseButton(bool pressed, uint16_t macButton);
   bool onMouseWheel(int32_t xDelta, int32_t yDelta) const;
 
   void constructMouseButtonEventMap();
+  void startHIDMouseButtonCapture();
+  void stopHIDMouseButtonCapture();
 
   bool onKey(CGEventRef event);
 
@@ -168,6 +179,7 @@ private:
   static CGEventRef handleCGInputEvent(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *refcon);
   static CGEventRef
   handleCGInputEventSecondary(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *refcon);
+  static void handleHIDInputValue(void *context, IOReturn result, void *sender, IOHIDValueRef value);
 
   // convert CFString to char*
   static char *CFStringRefToUTF8String(CFStringRef aString);
@@ -221,7 +233,7 @@ private:
   bool m_isPrimary;
 
   // true if mouse has entered the screen
-  bool m_isOnScreen;
+  std::atomic<bool> m_isOnScreen;
 
   // the display
   CGDirectDisplayID m_displayID;
@@ -299,6 +311,14 @@ private:
   CFRunLoopSourceRef m_eventTapRLSR;
   std::thread m_eventTapThread;
   CFRunLoopRef m_eventTapRunLoop = nullptr;
+
+  std::thread m_hidThread;
+  std::atomic<CFRunLoopRef> m_hidRunLoop = nullptr;
+  std::atomic<bool> m_hidStopRequested = false;
+  std::mutex m_hidMouseButtonMutex;
+  std::array<bool, NumButtonIDs> m_hidMouseButtonState{};
+  std::array<bool, NumButtonIDs> m_hidMouseButtonForwarded{};
+  std::array<CFTimeInterval, NumButtonIDs> m_hidQuartzSuppressUntil{};
 
   // for double click coalescing.
   double m_lastClickTime;

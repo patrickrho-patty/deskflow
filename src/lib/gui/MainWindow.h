@@ -21,12 +21,14 @@
 #include "net/Fingerprint.h"
 
 #ifdef Q_OS_MACOS
+#include "gui/LogiOptionsPlus.h"
 #include "gui/OSXHelpers.h"
 #endif
 
 class QAction;
 class QMenu;
 class QLocalServer;
+class QCheckBox;
 
 class DeskflowApplication;
 class LogDock;
@@ -144,6 +146,12 @@ private:
 
   bool canRunCore() const;
 
+#ifdef Q_OS_MACOS
+  void setupLogiOptionsPlusControl();
+  void refreshLogiOptionsPlusControl();
+  void setLogiOptionsPlusSideButtons(bool enabled);
+#endif
+
   /**
    * @brief trustedFingerprintDatabase get the FingerprintDatabase for the trusted clients or trusted servers.
    * @return The path to the trusted fingerprint file
@@ -208,4 +216,9 @@ private:
   // Server IP strategy optimization
   QStringList m_serverStartIPs;
   QString m_serverStartSuggestedIP;
+
+#ifdef Q_OS_MACOS
+  deskflow::gui::LogiOptionsPlus m_logiOptionsPlus;
+  QCheckBox *m_logiOptionsPlusSideButtons = nullptr;
+#endif
 };

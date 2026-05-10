@@ -45,6 +45,10 @@
 	<key>com.apple.security.networking.local</key>
 	<true/>
 
+	<!-- Input Monitoring -->
+	<key>NSInputMonitoringUsageDescription</key>
+	<string>This app uses input monitoring to capture keyboard and mouse input, including extra mouse buttons, while sharing control with another computer.</string>
+
 	<!-- Accessibility Entitlements -->
 	<key>com.apple.security.accessibility</key>
 	<array>

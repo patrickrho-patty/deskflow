@@ -35,11 +35,19 @@
 
 #include <AppKit/NSEvent.h>
 #include <AvailabilityMacros.h>
+#include <IOKit/hid/IOHIDDevice.h>
+#include <IOKit/hid/IOHIDElement.h>
+#include <IOKit/hid/IOHIDKeys.h>
+#include <IOKit/hid/IOHIDManager.h>
+#include <IOKit/hid/IOHIDUsageTables.h>
+#include <IOKit/hidsystem/IOLLEvent.h>
+#include <IOKit/hidsystem/IOHIDLib.h>
 #include <IOKit/hidsystem/event_status_driver.h>
 #include <dispatch/dispatch.h>
 #include <libproc.h>
 #include <mach-o/dyld.h>
 #include <math.h>
+#include <string>
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -59,7 +67,136 @@ enum
   kDeskflowMouseScrollAxisY = 'saxy'
 };
 
+namespace {
+void setHIDMatchingNumber(CFMutableDictionaryRef dict, CFStringRef key, uint32_t value)
+{
+  int32_t number = static_cast<int32_t>(value);
+  CFNumberRef cfNumber = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &number);
+  CFDictionarySetValue(dict, key, cfNumber);
+  CFRelease(cfNumber);
+}
+
+CFMutableDictionaryRef createHIDDeviceMatchingDictionary(uint32_t usagePage, uint32_t usage)
+{
+  CFMutableDictionaryRef dict =
+      CFDictionaryCreateMutable(kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+  setHIDMatchingNumber(dict, CFSTR(kIOHIDDeviceUsagePageKey), usagePage);
+  setHIDMatchingNumber(dict, CFSTR(kIOHIDDeviceUsageKey), usage);
+  return dict;
+}
+
+CFMutableArrayRef createHIDDeviceMatchingArray()
+{
+  CFMutableArrayRef matches = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
+
+  CFMutableDictionaryRef mouse = createHIDDeviceMatchingDictionary(kHIDPage_GenericDesktop, kHIDUsage_GD_Mouse);
+  CFArrayAppendValue(matches, mouse);
+  CFRelease(mouse);
+
+  CFMutableDictionaryRef consumer =
+      createHIDDeviceMatchingDictionary(kHIDPage_Consumer, kHIDUsage_Csmr_ConsumerControl);
+  CFArrayAppendValue(matches, consumer);
+  CFRelease(consumer);
+
+  return matches;
+}
+
+CFMutableDictionaryRef createHIDElementMatchingDictionary(uint32_t usagePage, uint32_t usage)
+{
+  CFMutableDictionaryRef dict =
+      CFDictionaryCreateMutable(kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+  setHIDMatchingNumber(dict, CFSTR(kIOHIDElementUsagePageKey), usagePage);
+  setHIDMatchingNumber(dict, CFSTR(kIOHIDElementUsageKey), usage);
+  return dict;
+}
+
+CFMutableArrayRef createHIDInputValueMatchingArray()
+{
+  CFMutableArrayRef matches = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
+
+  for (uint32_t usage = kButtonExtra0; usage <= kButtonExtra1; ++usage) {
+    CFMutableDictionaryRef match = createHIDElementMatchingDictionary(kHIDPage_Button, usage);
+    CFArrayAppendValue(matches, match);
+    CFRelease(match);
+  }
+
+  CFMutableDictionaryRef back = createHIDElementMatchingDictionary(kHIDPage_Consumer, kHIDUsage_Csmr_ACBack);
+  CFArrayAppendValue(matches, back);
+  CFRelease(back);
+
+  CFMutableDictionaryRef forward = createHIDElementMatchingDictionary(kHIDPage_Consumer, kHIDUsage_Csmr_ACForward);
+  CFArrayAppendValue(matches, forward);
+  CFRelease(forward);
+
+  return matches;
+}
+
+const char *buttonActionName(bool pressed)
+{
+  return pressed ? "press" : "release";
+}
+
+const char *hidAccessName(IOHIDAccessType access)
+{
+  switch (access) {
+  case kIOHIDAccessTypeGranted:
+    return "granted";
+  case kIOHIDAccessTypeDenied:
+    return "denied";
+  case kIOHIDAccessTypeUnknown:
+    return "unknown";
+  }
+
+  return "unrecognized";
+}
+
+int32_t getHIDDeviceNumberProperty(IOHIDDeviceRef device, CFStringRef key)
+{
+  CFTypeRef value = IOHIDDeviceGetProperty(device, key);
+  if (value == nullptr || CFGetTypeID(value) != CFNumberGetTypeID()) {
+    return 0;
+  }
+
+  int32_t number = 0;
+  CFNumberGetValue(static_cast<CFNumberRef>(value), kCFNumberSInt32Type, &number);
+  return number;
+}
+
+std::string getHIDDeviceStringProperty(IOHIDDeviceRef device, CFStringRef key)
+{
+  CFTypeRef value = IOHIDDeviceGetProperty(device, key);
+  if (value == nullptr || CFGetTypeID(value) != CFStringGetTypeID()) {
+    return {};
+  }
+
+  char buffer[256] = {};
+  if (!CFStringGetCString(static_cast<CFStringRef>(value), buffer, sizeof(buffer), kCFStringEncodingUTF8)) {
+    return {};
+  }
+
+  return buffer;
+}
+
+std::string describeHIDDevice(IOHIDDeviceRef device)
+{
+  std::string product = getHIDDeviceStringProperty(device, CFSTR(kIOHIDProductKey));
+  if (product.empty()) {
+    product = "unknown";
+  }
+
+  char suffix[128] = {};
+  snprintf(
+      suffix, sizeof(suffix), " vendor=0x%x product=0x%x",
+      getHIDDeviceNumberProperty(device, CFSTR(kIOHIDVendorIDKey)),
+      getHIDDeviceNumberProperty(device, CFSTR(kIOHIDProductIDKey))
+  );
+  product += suffix;
+  return product;
+}
+} // namespace
+
 static const double kCarbonLoopWaitTimeout = 10.0;
+static constexpr CFTimeInterval kHIDQuartzSuppressInterval = 0.25;
 
 int getSecureInputEventPID();
 std::string getProcessName(int pid);
@@ -666,6 +803,8 @@ void OSXScreen::enable()
   m_events->addHandler(EventTypes::Timer, m_axTimer, [this](const auto &) { checkAXPermissions(); });
 
   if (m_isPrimary) {
+    startHIDMouseButtonCapture();
+
     // FIXME -- start watching jump zones
 
     // kCGEventTapOptionDefault = 0x00000000 (Missing in 10.4, so specified literally)
@@ -719,6 +858,8 @@ void OSXScreen::disable()
 {
   showCursor();
 
+  stopHIDMouseButtonCapture();
+
   // FIXME -- stop watching jump zones, stop capturing input
 
   if (m_eventTapRunLoop) {
@@ -752,12 +893,12 @@ void OSXScreen::disable()
     m_axTimer = nullptr;
   }
 
-  m_isOnScreen = m_isPrimary;
+  m_isOnScreen.store(m_isPrimary);
 }
 
 void OSXScreen::enter()
 {
-  m_isOnScreen = true;
+  m_isOnScreen.store(true);
   showCursor();
 
   if (m_isPrimary) {
@@ -793,7 +934,7 @@ void OSXScreen::leave()
   }
 
   // now off screen
-  m_isOnScreen = false;
+  m_isOnScreen.store(false);
 }
 
 bool OSXScreen::setClipboard(ClipboardID, const IClipboard *src)
@@ -972,12 +1113,12 @@ bool OSXScreen::onMouseMove()
   m_xCursor = (int32_t)mx;
   m_yCursor = (int32_t)my;
 
-  if (m_isOnScreen) {
+  if (m_isOnScreen.load()) {
     // motion on primary screen
     sendEvent(EventTypes::PrimaryScreenMotionOnPrimary, MotionInfo::alloc(m_xCursor, m_yCursor));
   } else {
-    // motion on secondary screen.  warp mouse back to
-    // center.
+    // motion on secondary screen. warp mouse back to
+    // center, if allowed.
     warpCursor(m_xCenter, m_yCenter);
 
     // examine the motion.  if it's about the distance
@@ -1019,19 +1160,384 @@ bool OSXScreen::onMouseButton(bool pressed, uint16_t macButton)
 
   if (pressed) {
     LOG_DEBUG1("event: button press button=%d", button);
-    if (button != kButtonNone) {
-      KeyModifierMask mask = m_keyState->getActiveModifiers();
-      sendEvent(EventTypes::PrimaryScreenButtonDown, ButtonInfo::alloc(button, mask));
-    }
   } else {
     LOG_DEBUG1("event: button release button=%d", button);
-    if (button != kButtonNone) {
-      KeyModifierMask mask = m_keyState->getActiveModifiers();
-      sendEvent(EventTypes::PrimaryScreenButtonUp, ButtonInfo::alloc(button, mask));
+  }
+  if (button == kButtonNone) {
+    return true;
+  }
+
+  KeyModifierMask mask = m_keyState->getActiveModifiers();
+  sendMouseButtonEvent(pressed, button, mask);
+
+  return true;
+}
+
+void OSXScreen::sendMouseButtonEvent(bool pressed, ButtonID button, KeyModifierMask mask) const
+{
+  if (button == kButtonNone) {
+    return;
+  }
+
+  const EventTypes type = pressed ? EventTypes::PrimaryScreenButtonDown : EventTypes::PrimaryScreenButtonUp;
+  sendEvent(type, ButtonInfo::alloc(button, mask));
+}
+
+void OSXScreen::postLocalNavigationShortcut(ButtonID button) const
+{
+  if (button != kButtonExtra0 && button != kButtonExtra1) {
+    return;
+  }
+
+  const CGKeyCode key = (button == kButtonExtra0) ? kVK_LeftArrow : kVK_RightArrow;
+  CGEventRef commandDown = CGEventCreateKeyboardEvent(nullptr, kVK_Command, true);
+  CGEventRef keyDown = CGEventCreateKeyboardEvent(nullptr, key, true);
+  CGEventRef keyUp = CGEventCreateKeyboardEvent(nullptr, key, false);
+  CGEventRef commandUp = CGEventCreateKeyboardEvent(nullptr, kVK_Command, false);
+
+  if (commandDown == nullptr || keyDown == nullptr || keyUp == nullptr || commandUp == nullptr) {
+    if (commandDown != nullptr) {
+      CFRelease(commandDown);
     }
+    if (keyDown != nullptr) {
+      CFRelease(keyDown);
+    }
+    if (keyUp != nullptr) {
+      CFRelease(keyUp);
+    }
+    if (commandUp != nullptr) {
+      CFRelease(commandUp);
+    }
+    return;
+  }
+
+  CGEventSetFlags(commandDown, kCGEventFlagMaskCommand);
+  CGEventSetFlags(keyDown, kCGEventFlagMaskCommand);
+  CGEventSetFlags(keyUp, kCGEventFlagMaskCommand);
+  CGEventSetFlags(commandUp, 0);
+
+  CGEventPost(kCGHIDEventTap, commandDown);
+  CGEventPost(kCGHIDEventTap, keyDown);
+  CGEventPost(kCGHIDEventTap, keyUp);
+  CGEventPost(kCGHIDEventTap, commandUp);
+
+  CFRelease(commandDown);
+  CFRelease(keyDown);
+  CFRelease(keyUp);
+  CFRelease(commandUp);
+}
+
+bool OSXScreen::onAuxMouseButtons(CGEventRef event)
+{
+  NSEvent *nsEvent = nil;
+  @try {
+    nsEvent = [NSEvent eventWithCGEvent:event];
+  } @catch (NSException *) {
+    return false;
+  }
+
+  if ([nsEvent subtype] != NX_SUBTYPE_AUX_MOUSE_BUTTONS) {
+    return false;
+  }
+
+  const auto changedMask = static_cast<uint32_t>([nsEvent data1]);
+  const auto stateMask = static_cast<uint32_t>([nsEvent data2]);
+  LOG_DEBUG2(
+      "aux mouse raw subtype=%d data1=0x%lx data2=0x%lx flags=0x%llx cgButton=%lld cgSubtype=%lld sourcePid=%lld "
+      "targetPid=%lld userData=%lld onPrimary=%d",
+      [nsEvent subtype], static_cast<unsigned long>([nsEvent data1]), static_cast<unsigned long>([nsEvent data2]),
+      static_cast<unsigned long long>(CGEventGetFlags(event)),
+      static_cast<long long>(CGEventGetIntegerValueField(event, kCGMouseEventButtonNumber)),
+      static_cast<long long>(CGEventGetIntegerValueField(event, kCGMouseEventSubtype)),
+      static_cast<long long>(CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID)),
+      static_cast<long long>(CGEventGetIntegerValueField(event, kCGEventTargetUnixProcessID)),
+      static_cast<long long>(CGEventGetIntegerValueField(event, kCGEventSourceUserData)), m_isOnScreen.load()
+  );
+  bool handledExtraButton = false;
+
+  for (ButtonID button : {kButtonExtra0, kButtonExtra1}) {
+    const uint32_t buttonMask = 1u << (button - 1);
+    if ((changedMask & buttonMask) == 0) {
+      continue;
+    }
+
+    const bool pressed = (stateMask & buttonMask) != 0;
+    handledExtraButton = true;
+
+    {
+      const CFTimeInterval now = CFAbsoluteTimeGetCurrent();
+      std::lock_guard<std::mutex> lock(m_hidMouseButtonMutex);
+      if (m_hidQuartzSuppressUntil[button] > now) {
+        LOG_DEBUG1("suppressed duplicate aux mouse %s button=%d after hid event", buttonActionName(pressed), button);
+        continue;
+      }
+    }
+
+    if (m_isOnScreen.load()) {
+      LOG_DEBUG1(
+          "event: aux mouse button %s button=%d changed=0x%x state=0x%x ignored on primary screen",
+          buttonActionName(pressed), button, changedMask, stateMask
+      );
+      continue;
+    }
+
+    {
+      const CFTimeInterval now = CFAbsoluteTimeGetCurrent();
+      std::lock_guard<std::mutex> lock(m_hidMouseButtonMutex);
+      m_hidQuartzSuppressUntil[button] = now + kHIDQuartzSuppressInterval;
+    }
+
+    LOG_DEBUG1(
+        "event: aux mouse button %s button=%d changed=0x%x state=0x%x", buttonActionName(pressed), button,
+        changedMask, stateMask
+    );
+    sendMouseButtonEvent(pressed, button, m_keyState->getActiveModifiers());
+  }
+
+  if (!handledExtraButton) {
+    LOG_DEBUG2("ignoring aux mouse buttons changed=0x%x state=0x%x", changedMask, stateMask);
   }
 
   return true;
+}
+
+void OSXScreen::onHIDInputValue(IOHIDValueRef value)
+{
+  if (value == nullptr) {
+    return;
+  }
+
+  IOHIDElementRef element = IOHIDValueGetElement(value);
+  if (element == nullptr) {
+    return;
+  }
+
+  const uint32_t usagePage = IOHIDElementGetUsagePage(element);
+  const uint32_t usage = IOHIDElementGetUsage(element);
+  const bool pressed = IOHIDValueGetIntegerValue(value) != 0;
+
+  ButtonID button = kButtonNone;
+  const bool isMomentaryHistoryAction =
+      usagePage == kHIDPage_Consumer && (usage == kHIDUsage_Csmr_ACBack || usage == kHIDUsage_Csmr_ACForward);
+
+  if (usagePage == kHIDPage_Button) {
+    if (usage < kButtonExtra0 || usage > kButtonExtra1) {
+      LOG_DEBUG2("event: ignored hid mouse button usage=%u value=%d", usage, pressed ? 1 : 0);
+      return;
+    }
+    button = static_cast<ButtonID>(usage);
+  } else if (isMomentaryHistoryAction) {
+    if (!pressed) {
+      return;
+    }
+    button = (usage == kHIDUsage_Csmr_ACBack) ? kButtonExtra0 : kButtonExtra1;
+  } else {
+    return;
+  }
+
+  bool forwardPress = false;
+  bool forwardRelease = false;
+  bool localNavigationPress = false;
+  bool localNavigationRelease = false;
+
+  {
+    std::lock_guard<std::mutex> lock(m_hidMouseButtonMutex);
+
+    if (isMomentaryHistoryAction) {
+      const bool isOnScreen = m_isOnScreen.load();
+      forwardPress = !isOnScreen;
+      forwardRelease = !isOnScreen;
+      localNavigationPress = isOnScreen;
+    } else {
+      if (m_hidMouseButtonState[button] == pressed) {
+        LOG_DEBUG2("event: ignored duplicate hid mouse button %s button=%d", buttonActionName(pressed), button);
+        return;
+      }
+
+      m_hidMouseButtonState[button] = pressed;
+      const bool isOnScreen = m_isOnScreen.load();
+      if (pressed) {
+        localNavigationPress = isOnScreen;
+        m_hidMouseButtonForwarded[button] = !isOnScreen;
+        forwardPress = m_hidMouseButtonForwarded[button];
+      } else {
+        localNavigationRelease = isOnScreen;
+        forwardRelease = m_hidMouseButtonForwarded[button];
+        m_hidMouseButtonForwarded[button] = false;
+      }
+    }
+
+    if (forwardPress || forwardRelease || localNavigationPress || localNavigationRelease) {
+      const CFTimeInterval now = CFAbsoluteTimeGetCurrent();
+      m_hidQuartzSuppressUntil[button] = now + kHIDQuartzSuppressInterval;
+    }
+  }
+
+  if (localNavigationPress || localNavigationRelease) {
+    LOG_DEBUG1(
+        "event: hid side button %s button=%d page=0x%x usage=0x%x handled as local mac navigation",
+        buttonActionName(pressed), button, usagePage, usage
+    );
+    if (localNavigationPress) {
+      postLocalNavigationShortcut(button);
+    }
+    return;
+  }
+
+  if (!forwardPress && !forwardRelease) {
+    LOG_DEBUG1(
+        "event: hid side button %s button=%d page=0x%x usage=0x%x ignored on primary screen",
+        buttonActionName(pressed), button, usagePage, usage
+    );
+    return;
+  }
+
+  LOG_DEBUG1(
+      "event: hid side button %s button=%d page=0x%x usage=0x%x", buttonActionName(pressed), button, usagePage,
+      usage
+  );
+
+  if (forwardPress) {
+    sendMouseButtonEvent(true, button, 0);
+  }
+  if (forwardRelease) {
+    sendMouseButtonEvent(false, button, 0);
+  }
+}
+
+bool OSXScreen::shouldIgnoreQuartzMouseButton(bool pressed, uint16_t macButton)
+{
+  const ButtonID button = mapMacButtonToDeskflow(macButton);
+  if (button == kButtonNone || button >= NumButtonIDs) {
+    return false;
+  }
+  if (button != kButtonExtra0 && button != kButtonExtra1) {
+    return false;
+  }
+
+  const CFTimeInterval now = CFAbsoluteTimeGetCurrent();
+  std::lock_guard<std::mutex> lock(m_hidMouseButtonMutex);
+
+  if (m_hidQuartzSuppressUntil[button] > now) {
+    LOG_DEBUG1("suppressed duplicate quartz mouse %s button=%d after hid event", buttonActionName(pressed), button);
+    return true;
+  }
+
+  return false;
+}
+
+void OSXScreen::startHIDMouseButtonCapture()
+{
+  if (!m_isPrimary || m_hidThread.joinable()) {
+    return;
+  }
+
+  m_hidStopRequested.store(false);
+  m_hidThread = std::thread([this]() {
+    IOHIDAccessType listenAccess = IOHIDCheckAccess(kIOHIDRequestTypeListenEvent);
+    if (listenAccess != kIOHIDAccessTypeGranted) {
+      LOG_WARN(
+          "hid listen-event access is %s; requesting Input Monitoring permission for side-button capture",
+          hidAccessName(listenAccess)
+      );
+
+      if (!IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)) {
+        LOG_WARN(
+            "Input Monitoring permission was not granted to deskflow-core; Logitech side-button capture is unavailable"
+        );
+        return;
+      }
+    }
+
+    IOHIDManagerRef manager = IOHIDManagerCreate(kCFAllocatorDefault, kIOHIDOptionsTypeNone);
+    if (manager == nullptr) {
+      LOG_ERR("failed to create hid mouse button manager");
+      return;
+    }
+
+    CFMutableArrayRef deviceMatches = createHIDDeviceMatchingArray();
+    IOHIDManagerSetDeviceMatchingMultiple(manager, deviceMatches);
+    CFRelease(deviceMatches);
+
+    CFRunLoopRef runLoop = CFRunLoopGetCurrent();
+    m_hidRunLoop.store(runLoop);
+    IOHIDManagerScheduleWithRunLoop(manager, runLoop, kCFRunLoopDefaultMode);
+
+    CFMutableArrayRef inputMatches = createHIDInputValueMatchingArray();
+    CFSetRef devices = IOHIDManagerCopyDevices(manager);
+    std::vector<IOHIDDeviceRef> openedDevices;
+
+    if (devices != nullptr) {
+      const CFIndex deviceCount = CFSetGetCount(devices);
+      std::vector<const void *> deviceValues(static_cast<size_t>(deviceCount));
+      CFSetGetValues(devices, deviceValues.data());
+
+      for (const void *deviceValue : deviceValues) {
+        auto device = static_cast<IOHIDDeviceRef>(const_cast<void *>(deviceValue));
+        IOHIDDeviceSetInputValueMatchingMultiple(device, inputMatches);
+        IOHIDDeviceRegisterInputValueCallback(device, handleHIDInputValue, this);
+
+        IOHIDDeviceScheduleWithRunLoop(device, runLoop, kCFRunLoopDefaultMode);
+
+        IOReturn result = IOHIDDeviceOpen(device, kIOHIDOptionsTypeNone);
+        if (result == kIOReturnSuccess) {
+          CFRetain(device);
+          openedDevices.push_back(device);
+          LOG_INFO("opened hid side-button device: %s", describeHIDDevice(device).c_str());
+        } else {
+          IOHIDDeviceUnscheduleFromRunLoop(device, runLoop, kCFRunLoopDefaultMode);
+          LOG_DEBUG1(
+              "skipping hid side-button device: %s open failed with error=0x%08x",
+              describeHIDDevice(device).c_str(), result
+          );
+        }
+      }
+
+      CFRelease(devices);
+    }
+    CFRelease(inputMatches);
+
+    if (openedDevices.empty()) {
+      LOG_WARN("no hid side-button devices could be opened; side-button capture is unavailable");
+      IOHIDManagerUnscheduleFromRunLoop(manager, runLoop, kCFRunLoopDefaultMode);
+      CFRelease(manager);
+      m_hidRunLoop.store(nullptr);
+      return;
+    }
+
+    LOG_INFO("started hid mouse button capture for side buttons on %zu device(s)", openedDevices.size());
+
+    if (!m_hidStopRequested.load()) {
+      CFRunLoopRun();
+    }
+
+    for (IOHIDDeviceRef device : openedDevices) {
+      IOHIDDeviceUnscheduleFromRunLoop(device, runLoop, kCFRunLoopDefaultMode);
+      IOHIDDeviceClose(device, kIOHIDOptionsTypeNone);
+      CFRelease(device);
+    }
+    IOHIDManagerUnscheduleFromRunLoop(manager, runLoop, kCFRunLoopDefaultMode);
+    CFRelease(manager);
+    m_hidRunLoop.store(nullptr);
+    LOG_INFO("stopped hid mouse button capture");
+  });
+}
+
+void OSXScreen::stopHIDMouseButtonCapture()
+{
+  m_hidStopRequested.store(true);
+  if (CFRunLoopRef runLoop = m_hidRunLoop.load()) {
+    CFRunLoopStop(runLoop);
+  }
+  if (m_hidThread.joinable()) {
+    m_hidThread.join();
+  }
+  m_hidStopRequested.store(false);
+
+  std::lock_guard<std::mutex> lock(m_hidMouseButtonMutex);
+  m_hidMouseButtonState.fill(false);
+  m_hidMouseButtonForwarded.fill(false);
+  m_hidQuartzSuppressUntil.fill(0);
 }
 
 bool OSXScreen::onMouseWheel(int32_t xDelta, int32_t yDelta) const
@@ -1669,13 +2175,23 @@ CGEventRef OSXScreen::handleCGInputEvent(CGEventTapProxy proxy, CGEventType type
   case kCGEventLeftMouseDown:
   case kCGEventRightMouseDown:
   case kCGEventOtherMouseDown:
-    screen->onMouseButton(true, CGEventGetIntegerValueField(event, kCGMouseEventButtonNumber) + 1);
+  {
+    const auto macButton = static_cast<uint16_t>(CGEventGetIntegerValueField(event, kCGMouseEventButtonNumber) + 1);
+    if (!screen->shouldIgnoreQuartzMouseButton(true, macButton)) {
+      screen->onMouseButton(true, macButton);
+    }
     break;
+  }
   case kCGEventLeftMouseUp:
   case kCGEventRightMouseUp:
   case kCGEventOtherMouseUp:
-    screen->onMouseButton(false, CGEventGetIntegerValueField(event, kCGMouseEventButtonNumber) + 1);
+  {
+    const auto macButton = static_cast<uint16_t>(CGEventGetIntegerValueField(event, kCGMouseEventButtonNumber) + 1);
+    if (!screen->shouldIgnoreQuartzMouseButton(false, macButton)) {
+      screen->onMouseButton(false, macButton);
+    }
     break;
+  }
   case kCGEventLeftMouseDragged:
   case kCGEventRightMouseDragged:
   case kCGEventOtherMouseDragged:
@@ -1715,11 +2231,25 @@ CGEventRef OSXScreen::handleCGInputEvent(CGEventTapProxy proxy, CGEventType type
     break;
   default:
     if (type == NX_SYSDEFINED) {
-      if (isMediaKeyEvent(event)) {
+      if (screen->onAuxMouseButtons(event)) {
+        break;
+      } else if (isMediaKeyEvent(event)) {
         LOG_DEBUG2("detected media key event");
         screen->onMediaKey(event);
       } else {
-        LOG_DEBUG2("ignoring unknown system defined event");
+        NSEvent *nsEvent = nil;
+        @try {
+          nsEvent = [NSEvent eventWithCGEvent:event];
+        } @catch (NSException *) {
+        }
+        if (nsEvent != nil) {
+          LOG_DEBUG2(
+              "ignoring unknown system defined event subtype=%d data1=0x%lx data2=0x%lx", [nsEvent subtype],
+              static_cast<unsigned long>([nsEvent data1]), static_cast<unsigned long>([nsEvent data2])
+          );
+        } else {
+          LOG_DEBUG2("ignoring unknown system defined event");
+        }
         return event;
       }
       break;
@@ -1728,11 +2258,20 @@ CGEventRef OSXScreen::handleCGInputEvent(CGEventTapProxy proxy, CGEventType type
     LOG_DEBUG2("unknown quartz event type: 0x%02x", type);
   }
 
-  if (screen->m_isOnScreen) {
+  if (screen->m_isOnScreen.load()) {
     return event;
   } else {
     return nullptr;
   }
+}
+
+void OSXScreen::handleHIDInputValue(void *context, IOReturn result, void *, IOHIDValueRef value)
+{
+  if (result != kIOReturnSuccess || context == nullptr) {
+    return;
+  }
+
+  static_cast<OSXScreen *>(context)->onHIDInputValue(value);
 }
 
 void OSXScreen::MouseButtonState::set(uint32_t button, EMouseButtonState state)

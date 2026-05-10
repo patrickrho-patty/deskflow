@@ -8,6 +8,8 @@ set(CMAKE_INCLUDE_CURRENT_DIR ON)
 
 if(APPLE)
   set (platform_sources
+    LogiOptionsPlus.cpp
+    LogiOptionsPlus.h
     OSXHelpers.h
     OSXHelpers.mm
   )

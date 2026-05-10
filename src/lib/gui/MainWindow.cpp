@@ -35,6 +35,7 @@
 #include <QCloseEvent>
 #include <QDesktopServices>
 #include <QFileDialog>
+#include <QHBoxLayout>
 #include <QLocalServer>
 #include <QLocalSocket>
 #include <QMenu>
@@ -47,7 +48,9 @@
 #include <QRegularExpressionValidator>
 #include <QScreen>
 #include <QScrollBar>
+#include <QSignalBlocker>
 
+#include <algorithm>
 #include <memory>
 
 #if defined(Q_OS_MACOS)
@@ -220,11 +223,74 @@ void MainWindow::setupControls()
     ui->rbModeServer->setAttribute(Qt::WA_MacShowFocusRect, false);
     ui->rbModeClient->setAttribute(Qt::WA_MacShowFocusRect, false);
     ui->btnSaveServerConfig->setFixedWidth(ui->btnSaveServerConfig->height());
+#ifdef Q_OS_MACOS
+    setupLogiOptionsPlusControl();
+#endif
   } else {
     ui->btnSaveServerConfig->setIconSize(QSize(22, 22));
   }
   setStatusBar(m_statusBar);
 }
+
+#ifdef Q_OS_MACOS
+void MainWindow::setupLogiOptionsPlusControl()
+{
+  m_logiOptionsPlusSideButtons = new QCheckBox(tr("Logi Options side buttons"), this);
+  m_logiOptionsPlusSideButtons->setToolTip(
+      tr("Map Logi Options back/forward actions to mouse buttons 4 and 5 for Deskflow clients.")
+  );
+  m_logiOptionsPlusSideButtons->setAttribute(Qt::WA_MacShowFocusRect, false);
+
+  if (auto *layout = qobject_cast<QHBoxLayout *>(ui->serverOptions->layout())) {
+    layout->insertWidget(std::max(0, layout->count() - 1), m_logiOptionsPlusSideButtons);
+  }
+
+  connect(
+      m_logiOptionsPlusSideButtons, &QCheckBox::toggled, this, &MainWindow::setLogiOptionsPlusSideButtons
+  );
+  refreshLogiOptionsPlusControl();
+}
+
+void MainWindow::refreshLogiOptionsPlusControl()
+{
+  if (m_logiOptionsPlusSideButtons == nullptr) {
+    return;
+  }
+
+  QString errorMessage;
+  const auto status = m_logiOptionsPlus.sideButtonStatus(&errorMessage);
+  m_logiOptionsPlusSideButtons->setVisible(status.supported);
+  m_logiOptionsPlusSideButtons->setEnabled(status.supported);
+  if (!status.supported) {
+    if (!errorMessage.isEmpty()) {
+      qDebug().noquote() << "Logi Options side-button control hidden:" << errorMessage;
+    }
+    return;
+  }
+
+  const QSignalBlocker blocker(m_logiOptionsPlusSideButtons);
+  m_logiOptionsPlusSideButtons->setChecked(status.enabled);
+}
+
+void MainWindow::setLogiOptionsPlusSideButtons(bool enabled)
+{
+  if (m_logiOptionsPlusSideButtons == nullptr) {
+    return;
+  }
+
+  m_logiOptionsPlusSideButtons->setEnabled(false);
+
+  QString errorMessage;
+  if (!m_logiOptionsPlus.setSideButtonPatchEnabled(enabled, &errorMessage)) {
+    QMessageBox::warning(
+        this, tr("Logi Options"),
+        tr("Could not update Logi Options side-button settings.\n\n%1").arg(errorMessage)
+    );
+  }
+
+  refreshLogiOptionsPlusControl();
+}
+#endif
 
 //////////////////////////////////////////////////////////////////////////////
 // Begin slots

@@ -5,6 +5,8 @@
 
 # temp dirs created during build
 /build
+/build-flatpak
+/.flatpak-builder
 /dist
 /deps
 /tmp
